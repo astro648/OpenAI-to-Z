@@ -58,8 +58,14 @@ def read_h5_image(path: Path) -> np.ndarray:
     """
     if not path.is_file():
         raise FileNotFoundError(f"{path} does not exist")
-    if not h5py.is_hdf5(path):
-        raise ValueError(f"{path} is not a valid HDF5 file")
+
+    # Attempt to open the file to verify it is a valid HDF5 container. Using
+    # ``h5py.File`` directly provides clearer error messages when the file is
+    # corrupt or truncated compared to ``h5py.is_hdf5``.
+    try:
+        h5py.File(path, "r").close()
+    except OSError as exc:
+        raise ValueError(f"{path} is not a valid HDF5 file: {exc}") from exc
 
     # Determine the largest 2-D or 3-D dataset path first
     try:
