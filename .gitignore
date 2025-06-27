@@ -206,6 +206,7 @@ openai_api_key.txt
 *.las
 *.laz
 *.h5
+*.png
 *.nc
 
 # Notebooks and logs
@@ -217,6 +218,7 @@ __pycache__/
 # Data output
 outputs/
 *.csv
+!results.csv
 *.geojson
 *.json
 *.npy
