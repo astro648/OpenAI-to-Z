@@ -60,22 +60,25 @@ def read_h5_image(path: Path) -> np.ndarray:
         raise ValueError(f"{path} is not a valid HDF5 file")
 
     # Determine the largest 2-D or 3-D dataset path first
-    with h5py.File(path, "r") as f:
-        target_name = None
-        max_elems = 0
+    try:
+        with h5py.File(path, "r") as f:
+            target_name = None
+            max_elems = 0
 
-        def visitor(name, obj):
-            nonlocal target_name, max_elems
-            if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
-                size = np.prod(obj.shape)
-                if size > max_elems:
-                    target_name = name
-                    max_elems = size
+            def visitor(name, obj):
+                nonlocal target_name, max_elems
+                if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
+                    size = np.prod(obj.shape)
+                    if size > max_elems:
+                        target_name = name
+                        max_elems = size
 
-        f.visititems(visitor)
-        if target_name is None:
-            raise ValueError("No suitable dataset found")
-        arr = f[target_name][...].astype(np.float32)
+            f.visititems(visitor)
+            if target_name is None:
+                raise ValueError("No suitable dataset found")
+            arr = f[target_name][...].astype(np.float32)
+    except OSError as exc:
+        raise ValueError(f"Failed to open {path}: {exc}") from exc
     if arr.ndim == 2:
         arr = np.stack([arr] * 3, axis=-1)
     elif arr.ndim > 3:
