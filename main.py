@@ -56,6 +56,8 @@ def read_h5_image(path: Path) -> np.ndarray:
     The file may contain multiple datasets, so the dataset with the greatest
     number of elements is selected without loading each candidate into memory.
     """
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} does not exist")
     if not h5py.is_hdf5(path):
         raise ValueError(f"{path} is not a valid HDF5 file")
 
