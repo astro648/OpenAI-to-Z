@@ -1,15 +1,13 @@
-from earthaccess import Auth, DataGranules
+import earthaccess
 
-auth = Auth().login(strategy="browser")
-print("Authenticated:", auth.authenticated)
+earthaccess.login(strategy="browser")
 
-granules = DataGranules().search(
+granules = earthaccess.search_data(
     short_name="GEDI02_A",
     bounding_box=(-74.0, -8.0, -72.5, -6.0),  # Serra do Divisor
-    cloud_hosted=True,
+    cloud_hosted=True
 )
 
 print(f"Found {len(granules)} GEDI granules in Serra do Divisor")
 
-for granule in granules:
-    granule.download("./data/raw/serra/")
+earthaccess.download(granules, "./data/raw/serra/")

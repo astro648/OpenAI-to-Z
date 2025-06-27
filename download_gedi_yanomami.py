@@ -1,15 +1,13 @@
-from earthaccess import Auth, DataGranules
+import earthaccess
 
-auth = Auth().login(strategy="browser")
-print("Authenticated:", auth.authenticated)
+earthaccess.login(strategy="browser")
 
-granules = DataGranules().search(
+granules = earthaccess.search_data(
     short_name="GEDI02_A",
     bounding_box=(-65.0, 1.0, -62.0, 4.0),  # Yanomami Frontier
-    cloud_hosted=True,
+    cloud_hosted=True
 )
 
-print(f"Found {len(granules)} GEDI granules in Yanomami region")
+print(f"Found {len(granules)} GEDI granules in Yanomami Frontier")
 
-for granule in granules:
-    granule.download("./data/raw/yanomami/")
+earthaccess.download(granules, "./data/raw/yanomami/")
