@@ -1,4 +1,4 @@
-from earthaccess import Auth, DataGranules, Download
+from earthaccess import Auth, DataGranules
 
 auth = Auth().login(strategy="browser")
 print("Authenticated:", auth.authenticated)
@@ -10,4 +10,6 @@ granules = DataGranules().search(
 )
 
 print(f"Found {len(granules)} GEDI granules in Serra do Divisor")
-Download().download(granules, "./data/raw/serra/")
+
+for granule in granules:
+    granule.download("./data/raw/serra/")
