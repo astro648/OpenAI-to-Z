@@ -192,3 +192,38 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# OpenAI & Model-related
+openai_api_key.txt
+*.pt
+*.ckpt
+*.onnx
+
+# Remote sensing / geodata
+*.tif
+*.tiff
+*.img
+*.las
+*.laz
+*.h5
+*.nc
+
+# Notebooks and logs
+*.ipynb_checkpoints
+*.log
+logs/
+__pycache__/
+
+# Data output
+outputs/
+*.csv
+*.geojson
+*.json
+*.npy
+
+# Cloud platform metadata
+.DS_Store
+.env
+*.env
+.terraform/
+*.tfstate
