@@ -13,6 +13,8 @@ torch
 transformers
 earthengine-api
 boto3
-gdal
+h5py
+numpy
+matplotlib
 scipy
 shapely
