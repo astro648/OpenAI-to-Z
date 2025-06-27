@@ -89,13 +89,17 @@ def to_false_color(arr: np.ndarray) -> Image.Image:
     # Replace NaN values and normalise to 0‑1 range
     arr = np.nan_to_num(arr)
     arr -= arr.min()
-    if arr.max() > 0:
-        arr /= arr.max()
+    max_val = arr.max()
+    if max_val > 0:
+        arr /= max_val
 
     # Stretch to 8‑bit and enhance contrast per channel
     arr = (arr * 255).clip(0, 255).astype(np.uint8)
     for i in range(3):
-        arr[..., i] = (exposure.equalize_adapthist(arr[..., i]) * 255).astype(np.uint8)
+        if arr[..., i].max() > arr[..., i].min():
+            arr[..., i] = (
+                exposure.equalize_adapthist(arr[..., i]) * 255
+            ).astype(np.uint8)
 
     return Image.fromarray(arr, mode="RGB")
 
@@ -135,9 +139,8 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
 
     if openai.api_key:
         try:
-            client = openai.OpenAI(api_key=openai.api_key)
             logging.info("Sending image %s to OpenAI", image_path)
-            response = client.chat.completions.create(
+            response = openai.ChatCompletion.create(
                 model="gpt-4o", messages=messages
             )
             content = response.choices[0].message.content
@@ -162,10 +165,9 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
         return {"pros": "", "cons": "", "confidence": 0}
 
 
-def process_file(h5_path: Path, processed_dir: Path, writer: csv.writer) -> None:
+def process_file(h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.writer) -> None:
     """Convert a single ``.h5`` file to PNG and record OpenAI analysis."""
 
-    tile_id = find_tile_id(h5_path.name)
     logging.info("Processing %s", h5_path)
 
     try:
@@ -199,7 +201,14 @@ def main() -> None:
     processed_dir = Path(__file__).parent / "data" / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
     results_path = Path(__file__).parent / "results.csv"
-    write_header = not results_path.exists()
+    existing_ids = set()
+    write_header = not results_path.exists() or results_path.stat().st_size == 0
+
+    if results_path.exists():
+        with results_path.open('r', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                existing_ids.add(row.get("id", ""))
 
     with results_path.open('a', newline='') as csvfile:
         writer = csv.writer(csvfile)
@@ -211,7 +220,16 @@ def main() -> None:
         for folder in raw_root.iterdir():
             if folder.is_dir():
                 for h5_file in folder.glob("*.h5"):
-                    process_file(h5_file, processed_dir, writer)
+                    try:
+                        tile_id = find_tile_id(h5_file.name)
+                    except ValueError:
+                        logging.warning("Skipping malformed filename %s", h5_file)
+                        continue
+                    if tile_id in existing_ids:
+                        logging.info("Skipping %s - already processed", tile_id)
+                        continue
+                    process_file(h5_file, tile_id, processed_dir, writer)
+                    existing_ids.add(tile_id)
 
 
 if __name__ == '__main__':
