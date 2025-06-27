@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Path to API key file located at repository root
-API_KEY_FILE = Path(__file__).resolve().parent.parent / "openai_api_key.txt"
+API_KEY_FILE = Path(__file__).resolve().parent / "openai_api_key.txt"
 
 
 def load_openai_key() -> str:

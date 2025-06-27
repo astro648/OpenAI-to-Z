@@ -218,7 +218,7 @@ __pycache__/
 # Data output
 outputs/
 *.csv
-!main/results.csv
+!results.csv
 *.geojson
 *.json
 *.npy
