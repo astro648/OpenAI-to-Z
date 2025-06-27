@@ -13,7 +13,6 @@ named ``openai_api_key.txt`` located at the repository root.
 import re
 import json
 import logging
-import base64
 from pathlib import Path
 
 import h5py
@@ -115,35 +114,20 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
         " 'confidence' must be an integer score from 1-10."
     )
 
-    # Build the messages payload expected by ChatCompletion
-    # OpenAI expects image data as a base64 data URL. Read the PNG and
-    # embed it directly so that no external hosting is required.
-    with image_path.open("rb") as f:
-        b64_image = base64.b64encode(f.read()).decode("ascii")
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{b64_image}",
-                        "detail": "high",
-                    },
-                },
-            ],
-        }
-    ]
-
     if openai.api_key:
         try:
             logging.info("Sending image %s to OpenAI", image_path)
-            response = openai.ChatCompletion.create(
-                model="gpt-4o", messages=messages
-            )
-            content = response.choices[0].message.content
+            client = openai.OpenAI(api_key=openai.api_key)
+            with image_path.open("rb") as image_file:
+                response = client.responses.create(
+                    model="o3",
+                    reasoning={"effort": "high"},
+                    input=[
+                        {"role": "user", "content": prompt},
+                        {"role": "user", "image": image_file},
+                    ],
+                )
+            content = response.output_text
         except Exception as exc:
             logging.error("OpenAI API call failed: %s", exc)
             content = "{}"
