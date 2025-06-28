@@ -1,10 +1,9 @@
 """Download GEDI granules for the Rio Jutai headwaters."""
 
-from pathlib import Path
 import utils
 
 BBOX = (-68.5, -6.0, -68.5, -4.5)  # Rio Jutai Headwaters
-TARGET = Path("./data/raw/riojutai")
+TARGET = utils.data_path("riojutai")
 
 
 def main() -> None:

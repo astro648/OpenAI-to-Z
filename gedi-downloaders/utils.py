@@ -6,7 +6,12 @@ import os
 from pathlib import Path
 import earthaccess
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def data_path(subfolder: str) -> Path:
+    """Return the repository ``data/raw`` path joined with ``subfolder``."""
+    return ROOT / "data" / "raw" / subfolder
 
 
 def _read_credential(name: str) -> str:
@@ -20,16 +25,18 @@ def _read_credential(name: str) -> str:
 
 
 def login() -> None:
-    """Authenticate with Earthdata using environment variables or text files."""
+    """Authenticate with Earthdata using stored credentials or fall back to interactive login."""
     username = _read_credential("username")
     password = _read_credential("password")
-    try:
-        earthaccess.login(username=username, password=password)
-    except TypeError as exc:
-        if "unexpected keyword argument" in str(exc):
-            earthaccess.login(username, password)
-        else:
-            raise
+    if username and password:
+        try:
+            earthaccess.login(strategy="password", username=username, password=password)
+            return
+        except Exception as exc:  # pragma: no cover - best effort
+            print(f"Password login failed: {exc}\nFalling back to interactive login...")
+
+    # If no credentials or password login failed, attempt interactive login
+    earthaccess.login(strategy="interactive")
 
 
 def search(short_name: str, bbox: tuple[float, float, float, float]):

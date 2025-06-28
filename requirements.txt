@@ -14,6 +14,7 @@ transformers
 earthengine-api
 boto3
 h5py
+earthaccess
 numpy
 matplotlib
 scipy

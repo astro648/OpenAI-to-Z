@@ -1,10 +1,9 @@
 """Download GEDI granules for the Yanomami frontier."""
 
-from pathlib import Path
 import utils
 
 BBOX = (-65.0, 1.0, -62.0, 4.0)  # Yanomami Frontier
-TARGET = Path("./data/raw/yanomami")
+TARGET = utils.data_path("yanomami")
 
 
 def main() -> None:
