@@ -1,6 +1,15 @@
 import earthaccess
+from pathlib import Path
 
-earthaccess.login(strategy="browser")
+# Load Earthdata credentials from the repository root
+ROOT = Path(__file__).resolve().parent.parent
+username_path = ROOT / "username.txt"
+password_path = ROOT / "password.txt"
+username = username_path.read_text().strip() if username_path.exists() else ""
+password = password_path.read_text().strip() if password_path.exists() else ""
+
+# Authenticate using the stored credentials
+earthaccess.login(username=username, password=password)
 
 granules = earthaccess.search_data(
     short_name="GEDI02_A",
