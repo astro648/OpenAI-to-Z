@@ -1,9 +1,10 @@
 """Process GEDI Lidar tiles and query OpenAI for archaeological clues.
 
 Each ``.h5`` file under ``data/raw`` is converted into a high‑contrast
-false‑color PNG image saved in ``data/processed``. The image is then analysed
-using the OpenAI API and the results appended to ``results.csv``. The CSV
-contains the columns ``id``, ``pros``, ``cons`` and ``confidence``.
+false‑color PNG image saved in ``data/processed``. The image is analysed using
+the OpenAI API and results above a confidence of ``6`` are stored in CSV files
+under the ``results`` directory. The CSVs contain the columns ``id``, ``pros``,
+``cons`` and ``confidence``.
 
 The script is intentionally verbose with logging to aid in tracing processing
 and troubleshooting malformed files. The OpenAI API key is expected in a file
@@ -158,13 +159,25 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
 
 
 def process_file(h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.writer) -> None:
-    """Convert a single ``.h5`` file to PNG and record OpenAI analysis."""
+    """Convert a single ``.h5`` file to PNG and record OpenAI analysis.
+
+    The ``.h5`` file is removed after it has been read. Only results with a
+    confidence score of ``6`` or higher are kept; lower-confidence images are
+    deleted along with their CSV entries.
+    """
 
     logging.info("Processing %s", h5_path)
 
     try:
         arr = read_h5_image(h5_path)
         img = to_false_color(arr)
+
+        # Delete the original h5 tile once we have the image in memory
+        try:
+            h5_path.unlink()
+            logging.info("Deleted %s", h5_path)
+        except Exception as exc:  # pragma: no cover - deletion best effort
+            logging.warning("Failed to delete %s: %s", h5_path, exc)
 
         # Save processed image using the tile id for traceability
         img_name = f"{tile_id}.png"
@@ -173,12 +186,22 @@ def process_file(h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.w
 
         # Query the OpenAI API and append the results
         analysis = query_openai(img_path, tile_id)
-        writer.writerow([
-            tile_id,
-            analysis.get("pros", ""),
-            analysis.get("cons", ""),
-            analysis.get("confidence", ""),
-        ])
+        confidence = int(analysis.get("confidence", 0))
+
+        if confidence >= 6:
+            writer.writerow([
+                tile_id,
+                analysis.get("pros", ""),
+                analysis.get("cons", ""),
+                confidence,
+            ])
+        else:
+            # Remove low-confidence image and skip CSV entry
+            try:
+                img_path.unlink()
+                logging.info("Removed low confidence image %s", img_path)
+            except Exception as exc:  # pragma: no cover - deletion best effort
+                logging.warning("Failed to delete %s: %s", img_path, exc)
     except Exception as exc:
         logging.exception("Failed to process %s: %s", h5_path, exc)
 
@@ -192,36 +215,43 @@ def main() -> None:
     raw_root = Path(__file__).parent / "data" / "raw"
     processed_dir = Path(__file__).parent / "data" / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
-    results_path = Path(__file__).parent / "results.csv"
-    existing_ids = set()
-    write_header = not results_path.exists() or results_path.stat().st_size == 0
 
-    if results_path.exists():
-        with results_path.open('r', newline='') as csvfile:
-            reader = csv.DictReader(csvfile)
-            for row in reader:
-                existing_ids.add(row.get("id", ""))
+    results_dir = Path(__file__).parent / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
 
-    with results_path.open('a', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        if write_header:
-            # Create header on first run so the CSV is immediately usable
-            writer.writerow(["id", "pros", "cons", "confidence"])
+    name_map = {"riojutai": "jutai.csv", "serra": "serra.csv", "yanomami": "yanomami.csv"}
 
-        # Walk the raw data directories and process each ``.h5`` file
-        for folder in raw_root.iterdir():
-            if folder.is_dir():
-                for h5_file in folder.glob("*.h5"):
-                    try:
-                        tile_id = find_tile_id(h5_file.name)
-                    except ValueError:
-                        logging.warning("Skipping malformed filename %s", h5_file)
-                        continue
-                    if tile_id in existing_ids:
-                        logging.info("Skipping %s - already processed", tile_id)
-                        continue
-                    process_file(h5_file, tile_id, processed_dir, writer)
-                    existing_ids.add(tile_id)
+    # Walk the raw data directories and process each ``.h5`` file
+    for folder in raw_root.iterdir():
+        if not folder.is_dir():
+            continue
+
+        results_path = results_dir / name_map.get(folder.name, f"{folder.name}.csv")
+        existing_ids = set()
+        write_header = not results_path.exists() or results_path.stat().st_size == 0
+
+        if results_path.exists():
+            with results_path.open('r', newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    existing_ids.add(row.get("id", ""))
+
+        with results_path.open('a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            if write_header:
+                writer.writerow(["id", "pros", "cons", "confidence"])
+
+            for h5_file in folder.glob("*.h5"):
+                try:
+                    tile_id = find_tile_id(h5_file.name)
+                except ValueError:
+                    logging.warning("Skipping malformed filename %s", h5_file)
+                    continue
+                if tile_id in existing_ids:
+                    logging.info("Skipping %s - already processed", tile_id)
+                    continue
+                process_file(h5_file, tile_id, processed_dir, writer)
+                existing_ids.add(tile_id)
 
 
 if __name__ == '__main__':
