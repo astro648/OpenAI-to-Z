@@ -71,9 +71,10 @@ def read_h5_image(path: Path) -> np.ndarray:
             target_score = -1
             backup_name = None
             backup_size = 0
+            single_channel_name = None
 
             def visitor(name, obj):
-                nonlocal target_name, target_score, backup_name, backup_size
+                nonlocal target_name, target_score, backup_name, backup_size, single_channel_name
                 if not isinstance(obj, h5py.Dataset) or obj.ndim < 2:
                     return
 
@@ -88,6 +89,10 @@ def read_h5_image(path: Path) -> np.ndarray:
                         target_name = name
                         target_score = rows
 
+                # Backup candidate when only one band exists
+                if obj.ndim == 2 and obj.shape[1] == 1 and single_channel_name is None:
+                    single_channel_name = name
+
                 # Fallback: keep track of the largest dataset in case no match
                 size = np.prod(obj.shape)
                 if size > backup_size:
@@ -95,7 +100,7 @@ def read_h5_image(path: Path) -> np.ndarray:
                     backup_size = size
 
             f.visititems(visitor)
-            chosen = target_name or backup_name
+            chosen = target_name or single_channel_name or backup_name
             if chosen is None:
                 raise ValueError("No suitable dataset found")
             arr = f[chosen][...].astype(np.float32)
@@ -104,7 +109,9 @@ def read_h5_image(path: Path) -> np.ndarray:
     if arr.ndim == 2:
         arr = np.stack([arr] * 3, axis=-1)
     elif arr.ndim > 3:
+        logging.debug("Reshaping dataset from %s", arr.shape)
         arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
+        logging.debug("Reshaped to %s", arr.shape)
     if arr.shape[2] < 3:
         arr = np.repeat(arr, 3, axis=2)
     return arr[:, :, :3]
@@ -113,17 +120,21 @@ def read_h5_image(path: Path) -> np.ndarray:
 def to_false_color(arr: np.ndarray) -> Image.Image:
     """Convert an array to a high‑contrast false‑color ``PIL.Image``."""
 
-    # Replace NaN values and normalise valid pixels to 0‑1 range
-    mask = ~np.isnan(arr)
-    arr[~mask] = 0
-    if mask.any():
-        valid = arr[mask]
-        arr_min = valid.min()
-        arr_max = valid.max()
-        scale = arr_max - arr_min
-        if scale == 0:
-            scale = 1.0
-        arr[mask] = (valid - arr_min) / scale
+    # Replace NaNs and normalise each band separately
+    for i in range(arr.shape[2]):
+        band = arr[..., i]
+        mask = ~np.isnan(band)
+        if mask.any():
+            band[~mask] = 0
+            band_min = band[mask].min()
+            band_max = band[mask].max()
+            scale = band_max - band_min
+            if scale == 0:
+                scale = 1.0
+            band[mask] = (band[mask] - band_min) / scale
+        else:
+            band[:] = 0
+        arr[..., i] = band
 
     # Stretch to 8‑bit and enhance contrast per channel
     arr = (arr * 255).clip(0, 255).astype(np.uint8)
