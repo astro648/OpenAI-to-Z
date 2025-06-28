@@ -104,6 +104,12 @@ def read_h5_image(path: Path) -> np.ndarray:
             if chosen is None:
                 raise ValueError("No suitable dataset found")
             arr = f[chosen][...].astype(np.float32)
+            logging.info(
+                "Using dataset '%s' from %s with shape %s",
+                chosen,
+                path.name,
+                arr.shape,
+            )
     except OSError as exc:
         raise ValueError(f"Failed to open {path}: {exc}") from exc
     if arr.ndim == 2:
@@ -193,12 +199,15 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
         return {"pros": "", "cons": "", "confidence": 0}
 
 
-def process_file(h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.writer) -> None:
+def process_file(
+    h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.writer, csvfile
+) -> None:
     """Convert a single ``.h5`` file to PNG and record OpenAI analysis.
 
     The ``.h5`` file is removed after it has been read. Only results with a
     confidence score of ``6`` or higher are kept; lower-confidence images are
-    deleted along with their CSV entries.
+    deleted along with their CSV entries. ``csvfile`` is the open CSV handle
+    used so writes can be flushed after each row.
     """
 
     logging.info("Processing %s", h5_path)
@@ -221,7 +230,11 @@ def process_file(h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.w
 
         # Query the OpenAI API and append the results
         analysis = query_openai(img_path, tile_id)
-        confidence = int(analysis.get("confidence", 0))
+        try:
+            confidence = int(float(analysis.get("confidence", 0)))
+        except (ValueError, TypeError):
+            logging.warning("Invalid confidence value for tile %s", tile_id)
+            confidence = 0
 
         if confidence >= 6:
             writer.writerow([
@@ -230,6 +243,7 @@ def process_file(h5_path: Path, tile_id: str, processed_dir: Path, writer: csv.w
                 analysis.get("cons", ""),
                 confidence,
             ])
+            csvfile.flush()
         else:
             # Remove low-confidence image and skip CSV entry
             try:
@@ -293,7 +307,7 @@ def main() -> None:
                 if tile_id in existing_ids:
                     logging.info("Skipping %s - already processed", tile_id)
                     continue
-                process_file(h5_file, tile_id, processed_dir, writer)
+                process_file(h5_file, tile_id, processed_dir, writer, csvfile)
                 existing_ids.add(tile_id)
 
 
