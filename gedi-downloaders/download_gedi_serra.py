@@ -9,7 +9,9 @@ username = username_path.read_text().strip() if username_path.exists() else ""
 password = password_path.read_text().strip() if password_path.exists() else ""
 
 # Authenticate using the stored credentials
-earthaccess.login(username=username, password=password)
+# ``earthaccess.login`` expects positional arguments for the username and
+# password rather than keyword arguments.
+earthaccess.login(username, password)
 
 granules = earthaccess.search_data(
     short_name="GEDI02_A",
