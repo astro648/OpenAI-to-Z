@@ -16,6 +16,7 @@ named ``openai_api_key.txt`` located at the repository root.
 import re
 import json
 import logging
+import os
 from pathlib import Path
 import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -122,6 +123,8 @@ def read_h5_image(path: Path) -> np.ndarray:
         logging.debug("Reshaping dataset from %s", arr.shape)
         arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
         logging.debug("Reshaped to %s", arr.shape)
+        if arr.ndim != 3 or not (1 <= arr.shape[2] <= 10):
+            raise ValueError(f"Unexpected dataset shape {arr.shape}")
     if arr.shape[2] < 3:
         arr = np.repeat(arr, 3, axis=2)
     return arr[:, :, :3]
@@ -205,27 +208,28 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
 
 def process_file(
     h5_path: Path, tile_id: str, processed_dir: Path
-) -> typing.Optional[list]:
+) -> tuple[typing.Optional[list], str]:
     """Convert a single ``.h5`` file to PNG and return analysis results.
 
     The ``.h5`` file is removed after it has been read. Only results with a
     confidence score of ``6`` or higher are kept; lower-confidence images are
-    deleted along with their corresponding images. If the confidence meets the
-    threshold, a list containing the CSV row data is returned.
+    deleted along with their corresponding images. The function returns a tuple
+    ``(row, status)`` where ``row`` is the CSV data or ``None`` and ``status``
+    is one of ``'passed'``, ``'skipped'`` or ``'failed'``.
     """
 
     logging.info("Processing %s", h5_path)
 
     try:
         arr = read_h5_image(h5_path)
-        img = to_false_color(arr)
-
-        # Delete the original h5 tile once we have the image in memory
+        # Delete the original h5 tile only after the array was read
         try:
             h5_path.unlink()
             logging.info("Deleted %s", h5_path)
         except Exception as exc:  # pragma: no cover - deletion best effort
             logging.warning("Failed to delete %s: %s", h5_path, exc)
+
+        img = to_false_color(arr)
 
         # Save processed image using the tile id for traceability
         img_name = f"{tile_id}.png"
@@ -241,12 +245,15 @@ def process_file(
             confidence = 0
 
         if confidence >= 6:
-            return [
-                tile_id,
-                analysis.get("pros", ""),
-                analysis.get("cons", ""),
-                confidence,
-            ]
+            return (
+                [
+                    tile_id,
+                    analysis.get("pros", ""),
+                    analysis.get("cons", ""),
+                    confidence,
+                ],
+                "passed",
+            )
         else:
             # Remove low-confidence image and skip CSV entry
             try:
@@ -254,9 +261,10 @@ def process_file(
                 logging.info("Removed low confidence image %s", img_path)
             except Exception as exc:  # pragma: no cover - deletion best effort
                 logging.warning("Failed to delete %s: %s", img_path, exc)
+            return (None, "skipped")
     except Exception as exc:
         logging.exception("Failed to process %s: %s", h5_path, exc)
-    return None
+        return (None, "failed")
 
 
 def main() -> None:
@@ -295,7 +303,7 @@ def main() -> None:
             with results_path.open('r', newline='') as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
-                    existing_ids.add(row.get("id", ""))
+                    existing_ids.add(row.get("id", "")[:3])
 
         with results_path.open('a', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -303,26 +311,39 @@ def main() -> None:
                 writer.writerow(["id", "pros", "cons", "confidence"])
 
             futures = []
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            max_workers = min(16, os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for h5_file in folder.glob("*.h5"):
                     try:
                         tile_id = find_tile_id(h5_file.name)
                     except ValueError:
                         logging.warning("Skipping malformed filename %s", h5_file)
                         continue
-                    if tile_id in existing_ids:
+                    short_id = tile_id[:3]
+                    if short_id in existing_ids:
                         logging.info("Skipping %s - already processed", tile_id)
                         continue
                     futures.append(
                         executor.submit(process_file, h5_file, tile_id, processed_dir)
                     )
-                    existing_ids.add(tile_id)
+                    existing_ids.add(short_id)
 
+                stats = {"total": 0, "passed": 0, "skipped": 0, "failed": 0}
                 for future in as_completed(futures):
-                    row = future.result()
+                    row, status = future.result()
+                    stats["total"] += 1
+                    stats[status] += 1
                     if row:
                         writer.writerow(row)
                         csvfile.flush()
+                logging.info(
+                    "Summary for %s: total=%d passed=%d skipped=%d failed=%d",
+                    folder.name,
+                    stats["total"],
+                    stats["passed"],
+                    stats["skipped"],
+                    stats["failed"],
+                )
 
 
 if __name__ == '__main__':
