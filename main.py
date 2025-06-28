@@ -28,6 +28,9 @@ from skimage import exposure
 import openai
 import csv
 
+# Global OpenAI client reused across requests
+openai_client: typing.Optional[openai.OpenAI] = None
+
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -41,6 +44,8 @@ def load_openai_key() -> str:
         key = API_KEY_FILE.read_text().strip()
         if key:
             openai.api_key = key
+            global openai_client
+            openai_client = openai.OpenAI(api_key=key)
             logging.info("Loaded OpenAI API key from %s", API_KEY_FILE)
             return key
         logging.warning("OpenAI API key file %s is empty", API_KEY_FILE)
@@ -54,6 +59,19 @@ def find_tile_id(filename: str) -> str:
     if match:
         return match.group(1)
     raise ValueError(f"No tile id found in {filename}")
+
+
+def safe_cast(value: typing.Any, to_type: typing.Callable, default: typing.Any) -> typing.Any:
+    """Safely cast ``value`` to ``to_type`` returning ``default`` on failure."""
+    try:
+        return to_type(value)
+    except (ValueError, TypeError):
+        try:
+            if to_type is int:
+                return int(float(value))
+        except Exception:
+            pass
+        return default
 
 
 def read_h5_image(path: Path) -> np.ndarray:
@@ -174,9 +192,11 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
     if openai.api_key:
         try:
             logging.info("Sending image %s to OpenAI", image_path)
-            client = openai.OpenAI(api_key=openai.api_key)
+            global openai_client
+            if openai_client is None:
+                openai_client = openai.OpenAI(api_key=openai.api_key)
             with image_path.open("rb") as image_file:
-                response = client.responses.create(
+                response = openai_client.responses.create(
                     model="o3",
                     reasoning={"effort": "high"},
                     input=[
@@ -211,9 +231,9 @@ def process_file(
 ) -> tuple[typing.Optional[list], str]:
     """Convert a single ``.h5`` file to PNG and return analysis results.
 
-    The ``.h5`` file is removed after it has been read. Only results with a
-    confidence score of ``6`` or higher are kept; lower-confidence images are
-    deleted along with their corresponding images. The function returns a tuple
+    The raw ``.h5`` tile is deleted only after the image has been analysed.
+    Only results with a confidence score of ``6`` or higher are kept;
+    lower-confidence images are removed. The function returns a tuple
     ``(row, status)`` where ``row`` is the CSV data or ``None`` and ``status``
     is one of ``'passed'``, ``'skipped'`` or ``'failed'``.
     """
@@ -222,12 +242,6 @@ def process_file(
 
     try:
         arr = read_h5_image(h5_path)
-        # Delete the original h5 tile only after the array was read
-        try:
-            h5_path.unlink()
-            logging.info("Deleted %s", h5_path)
-        except Exception as exc:  # pragma: no cover - deletion best effort
-            logging.warning("Failed to delete %s: %s", h5_path, exc)
 
         img = to_false_color(arr)
 
@@ -238,22 +252,16 @@ def process_file(
 
         # Query the OpenAI API and append the results
         analysis = query_openai(img_path, tile_id)
-        try:
-            confidence = int(float(analysis.get("confidence", 0)))
-        except (ValueError, TypeError):
-            logging.warning("Invalid confidence value for tile %s", tile_id)
-            confidence = 0
+        confidence = safe_cast(analysis.get("confidence", 0), int, 0)
 
         if confidence >= 6:
-            return (
-                [
-                    tile_id,
-                    analysis.get("pros", ""),
-                    analysis.get("cons", ""),
-                    confidence,
-                ],
-                "passed",
-            )
+            row = [
+                tile_id,
+                analysis.get("pros", ""),
+                analysis.get("cons", ""),
+                confidence,
+            ]
+            status = "passed"
         else:
             # Remove low-confidence image and skip CSV entry
             try:
@@ -261,7 +269,17 @@ def process_file(
                 logging.info("Removed low confidence image %s", img_path)
             except Exception as exc:  # pragma: no cover - deletion best effort
                 logging.warning("Failed to delete %s: %s", img_path, exc)
-            return (None, "skipped")
+            row = None
+            status = "skipped"
+
+        # Delete the original h5 tile only after processing succeeded
+        try:
+            h5_path.unlink()
+            logging.info("Deleted %s", h5_path)
+        except Exception as exc:  # pragma: no cover - deletion best effort
+            logging.warning("Failed to delete %s: %s", h5_path, exc)
+
+        return (row, status)
     except Exception as exc:
         logging.exception("Failed to process %s: %s", h5_path, exc)
         return (None, "failed")
@@ -303,7 +321,7 @@ def main() -> None:
             with results_path.open('r', newline='') as csvfile:
                 reader = csv.DictReader(csvfile)
                 for row in reader:
-                    existing_ids.add(row.get("id", "")[:3])
+                    existing_ids.add(row.get("id", ""))
 
         with results_path.open('a', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -319,14 +337,13 @@ def main() -> None:
                     except ValueError:
                         logging.warning("Skipping malformed filename %s", h5_file)
                         continue
-                    short_id = tile_id[:3]
-                    if short_id in existing_ids:
+                    if tile_id in existing_ids:
                         logging.info("Skipping %s - already processed", tile_id)
                         continue
                     futures.append(
                         executor.submit(process_file, h5_file, tile_id, processed_dir)
                     )
-                    existing_ids.add(short_id)
+                    existing_ids.add(tile_id)
 
                 stats = {"total": 0, "passed": 0, "skipped": 0, "failed": 0}
                 for future in as_completed(futures):
