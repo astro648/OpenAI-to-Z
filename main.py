@@ -1,7 +1,9 @@
 """Process GEDI Lidar tiles and query OpenAI for archaeological clues.
 
 Each ``.h5`` file under ``data/raw`` is converted into a high‑contrast
-false‑color PNG image saved in ``data/processed``. The image is analysed using
+false‑color PNG image saved in subdirectories of ``data/processed`` that
+mirror the raw folder name (e.g. ``data/processed/serra`` for
+``data/raw/serra``). The image is analysed using
 the OpenAI API and results above a confidence of ``6`` are stored in CSV files
 under the ``results`` directory. The CSVs contain the columns ``id``, ``pros``,
 ``cons`` and ``confidence``.
@@ -62,24 +64,41 @@ def read_h5_image(path: Path) -> np.ndarray:
     if not h5py.is_hdf5(path):
         raise ValueError(f"{path} is not a valid HDF5 file")
 
-    # Determine the largest 2-D or 3-D dataset path first
+    # Choose a dataset based on heuristics rather than raw size
     try:
         with h5py.File(path, "r") as f:
             target_name = None
-            max_elems = 0
+            target_score = -1
+            backup_name = None
+            backup_size = 0
 
             def visitor(name, obj):
-                nonlocal target_name, max_elems
-                if isinstance(obj, h5py.Dataset) and obj.ndim >= 2:
-                    size = np.prod(obj.shape)
-                    if size > max_elems:
+                nonlocal target_name, target_score, backup_name, backup_size
+                if not isinstance(obj, h5py.Dataset) or obj.ndim < 2:
+                    return
+
+                # Preferred: a 2-D array with many rows and a small band count
+                if (
+                    obj.ndim == 2
+                    and obj.shape[0] > 1000
+                    and obj.shape[1] in (3, 6, 8)
+                ):
+                    rows = obj.shape[0]
+                    if rows > target_score:
                         target_name = name
-                        max_elems = size
+                        target_score = rows
+
+                # Fallback: keep track of the largest dataset in case no match
+                size = np.prod(obj.shape)
+                if size > backup_size:
+                    backup_name = name
+                    backup_size = size
 
             f.visititems(visitor)
-            if target_name is None:
+            chosen = target_name or backup_name
+            if chosen is None:
                 raise ValueError("No suitable dataset found")
-            arr = f[target_name][...].astype(np.float32)
+            arr = f[chosen][...].astype(np.float32)
     except OSError as exc:
         raise ValueError(f"Failed to open {path}: {exc}") from exc
     if arr.ndim == 2:
@@ -94,12 +113,17 @@ def read_h5_image(path: Path) -> np.ndarray:
 def to_false_color(arr: np.ndarray) -> Image.Image:
     """Convert an array to a high‑contrast false‑color ``PIL.Image``."""
 
-    # Replace NaN values and normalise to 0‑1 range
-    arr = np.nan_to_num(arr)
-    arr -= arr.min()
-    max_val = arr.max()
-    if max_val > 0:
-        arr /= max_val
+    # Replace NaN values and normalise valid pixels to 0‑1 range
+    mask = ~np.isnan(arr)
+    arr[~mask] = 0
+    if mask.any():
+        valid = arr[mask]
+        arr_min = valid.min()
+        arr_max = valid.max()
+        scale = arr_max - arr_min
+        if scale == 0:
+            scale = 1.0
+        arr[mask] = (valid - arr_min) / scale
 
     # Stretch to 8‑bit and enhance contrast per channel
     arr = (arr * 255).clip(0, 255).astype(np.uint8)
@@ -213,20 +237,28 @@ def main() -> None:
     load_openai_key()
 
     raw_root = Path(__file__).parent / "data" / "raw"
-    processed_dir = Path(__file__).parent / "data" / "processed"
-    processed_dir.mkdir(parents=True, exist_ok=True)
+    processed_root = Path(__file__).parent / "data" / "processed"
+    processed_root.mkdir(parents=True, exist_ok=True)
 
     results_dir = Path(__file__).parent / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    name_map = {"riojutai": "jutai.csv", "serra": "serra.csv", "yanomami": "yanomami.csv"}
+    name_map = {
+        "riojutai": ("jutai", "jutai.csv"),
+        "serra": ("serra", "serra.csv"),
+        "yanomami": ("yanomami", "yanomami.csv"),
+    }
 
     # Walk the raw data directories and process each ``.h5`` file
     for folder in raw_root.iterdir():
         if not folder.is_dir():
             continue
 
-        results_path = results_dir / name_map.get(folder.name, f"{folder.name}.csv")
+        proc_name, csv_name = name_map.get(folder.name, (folder.name, f"{folder.name}.csv"))
+        processed_dir = processed_root / proc_name
+        processed_dir.mkdir(parents=True, exist_ok=True)
+
+        results_path = results_dir / csv_name
         existing_ids = set()
         write_header = not results_path.exists() or results_path.stat().st_size == 0
 
