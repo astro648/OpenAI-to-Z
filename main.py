@@ -90,6 +90,13 @@ def _rasterize_gedi_tiles(
     long swaths do not produce huge intermediate arrays.
     """
 
+    logging.info(
+        "Starting rasterization grid_res=%s tile_px=%s max_dim=%s",
+        grid_res,
+        tile_px,
+        max_dim,
+    )
+
     lats = []
     lons = []
     rh100s = []
@@ -99,17 +106,21 @@ def _rasterize_gedi_tiles(
     for key in f.keys():
         if not key.startswith("BEAM"):
             continue
+        logging.info("Processing %s", key)
         beam = f[key]
         if "geolocation" not in beam:
+            logging.info("%s missing geolocation", key)
             continue
         geo = beam["geolocation"]
         for algo in range(1, 7):
+            logging.info("  Algorithm %s", algo)
             lat_name = f"lat_highestreturn_a{algo}"
             lon_name = f"lon_highestreturn_a{algo}"
             rh_name = f"rh_a{algo}"
             elev_name = f"elev_highestreturn_a{algo}"
             qual_name = f"quality_flag_a{algo}"
             if lat_name not in geo or lon_name not in geo or rh_name not in geo:
+                logging.info("    Required datasets missing for a%s", algo)
                 continue
             try:
                 lat = geo[lat_name][()]
@@ -157,6 +168,12 @@ def _rasterize_gedi_tiles(
                         elevs.append(elev[mask])
                     if energy is not None:
                         energies.append(energy[mask])
+                    logging.info(
+                        "    Collected %s points from %s algo %s",
+                        mask.sum(),
+                        key,
+                        algo,
+                    )
             except Exception:
                 continue
 
@@ -168,6 +185,7 @@ def _rasterize_gedi_tiles(
     rh100 = np.concatenate(rh100s)
     elev = np.concatenate(elevs) if elevs else np.zeros_like(rh100)
     energy = np.concatenate(energies) if energies else np.zeros_like(rh100)
+    logging.info("Total points after merge: %s", lat.size)
 
     lat_q1, lat_q3 = np.percentile(lat, [25, 75])
     lon_q1, lon_q3 = np.percentile(lon, [25, 75])
@@ -183,11 +201,13 @@ def _rasterize_gedi_tiles(
         & (lon >= lon_low)
         & (lon <= lon_high)
     )
+    removed = lat.size - keep.sum()
     lat = lat[keep]
     lon = lon[keep]
     rh100 = rh100[keep]
     elev = elev[keep]
     energy = energy[keep]
+    logging.info("Removed %s outliers", removed)
 
     lon_range = lon.max() - lon.min()
     lat_range = lat.max() - lat.min()
@@ -202,6 +222,12 @@ def _rasterize_gedi_tiles(
     lon_lin = np.arange(lon.min(), lon.max() + grid_res, grid_res)
     lat_lin = np.arange(lat.max(), lat.min() - grid_res, -grid_res)
     lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
+    logging.info(
+        "Raster grid %sx%s with resolution %s",
+        len(lat_lin),
+        len(lon_lin),
+        grid_res,
+    )
 
     grid_rh = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="nearest")
     grid_elev = griddata((lon, lat), elev, (lon_grid, lat_grid), method="nearest")
@@ -212,6 +238,7 @@ def _rasterize_gedi_tiles(
     grid_energy = np.nan_to_num(grid_energy, nan=0.0).astype(np.float32)
 
     arr = np.stack([grid_rh, grid_elev, grid_energy], axis=2)
+    logging.info("Stacked raster array shape %s", arr.shape)
 
     import math
     from skimage.transform import resize
@@ -223,6 +250,7 @@ def _rasterize_gedi_tiles(
     tile_size = min(width, height)
     along_height = height >= width
     n_tiles = int(math.ceil(max(height, width) / tile_size))
+    logging.info("Creating %s tiles", n_tiles)
 
     tiles: list[np.ndarray] = []
     for i in range(n_tiles):
@@ -238,6 +266,7 @@ def _rasterize_gedi_tiles(
             if patch.shape[1] < tile_size:
                 pad = tile_size - patch.shape[1]
                 patch = np.pad(patch, ((0, 0), (0, pad), (0, 0)), mode="constant")
+        logging.info("  Rasterizing tile %s/%s", i + 1, n_tiles)
         patch = resize(
             patch,
             (tile_px, tile_px, 3),
@@ -246,6 +275,7 @@ def _rasterize_gedi_tiles(
             anti_aliasing=False,
         ).astype(np.float32)
         tiles.append(patch)
+    logging.info("Rasterization completed with %s tiles", len(tiles))
 
     return tiles
 
@@ -262,16 +292,20 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
         raise FileNotFoundError(f"{path} does not exist")
     if not h5py.is_hdf5(path):
         raise ValueError(f"{path} is not a valid HDF5 file")
+    logging.info("Opening %s", path)
 
     try:
         with h5py.File(path, "r") as f:
+            logging.info("Scanning beams")
             has_beam = False
             for key in f.keys():
                 if not key.startswith("BEAM"):
                     continue
+                logging.info("Found %s", key)
                 beam = f[key]
                 geo = beam.get("geolocation")
                 if not isinstance(geo, h5py.Group):
+                    logging.info("%s missing geolocation", key)
                     continue
                 for algo in range(1, 7):
                     if (
@@ -279,17 +313,20 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
                         and f"lon_highestreturn_a{algo}" in geo
                         and f"rh_a{algo}" in geo
                     ):
+                        logging.info("Beam %s supports algorithm %s", key, algo)
                         has_beam = True
                         break
                 if has_beam:
                     break
             if not has_beam:
+                logging.info("No GEDI beam data found in %s", path.name)
                 raise ValueError(f"No GEDI beam data found in {path.name}")
 
             logging.info("Rasterizing GEDI tile %s", path.name)
             tiles = _rasterize_gedi_tiles(f)
             if not tiles:
                 raise ValueError("Rasterization produced no tiles")
+            logging.info("Rasterization yielded %s tiles", len(tiles))
             return tiles
     except OSError as exc:
         raise ValueError(f"Failed to open {path}: {exc}") from exc
