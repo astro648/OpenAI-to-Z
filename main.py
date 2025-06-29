@@ -129,20 +129,28 @@ def _rasterize_gedi_tiles(
     import math
     from skimage.transform import resize
 
-    width = arr.shape[1]
-    if width == 0:
-        raise ValueError("Empty raster width")
-    tile_height = width
-    n_tiles = int(math.ceil(arr.shape[0] / tile_height))
+    height, width = arr.shape[:2]
+    if width == 0 or height == 0:
+        raise ValueError("Empty raster dimensions")
+
+    tile_size = min(width, height)
+    along_height = height >= width
+    n_tiles = int(math.ceil(max(height, width) / tile_size))
 
     tiles: list[np.ndarray] = []
     for i in range(n_tiles):
-        start = i * tile_height
-        end = start + tile_height
-        patch = arr[start:end]
-        if patch.shape[0] < tile_height:
-            pad = tile_height - patch.shape[0]
-            patch = np.pad(patch, ((0, pad), (0, 0), (0, 0)), mode="constant")
+        start = i * tile_size
+        end = start + tile_size
+        if along_height:
+            patch = arr[start:end]
+            if patch.shape[0] < tile_size:
+                pad = tile_size - patch.shape[0]
+                patch = np.pad(patch, ((0, pad), (0, 0), (0, 0)), mode="constant")
+        else:
+            patch = arr[:, start:end]
+            if patch.shape[1] < tile_size:
+                pad = tile_size - patch.shape[1]
+                patch = np.pad(patch, ((0, 0), (0, pad), (0, 0)), mode="constant")
         patch = resize(
             patch,
             (tile_px, tile_px, 3),
