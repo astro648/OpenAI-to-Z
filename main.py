@@ -76,8 +76,17 @@ def safe_cast(value: typing.Any, to_type: typing.Callable, default: typing.Any) 
         return default
 
 
-def _rasterize_gedi(f: h5py.File, grid_res: float = 0.001) -> np.ndarray:
-    """Rasterize GEDI point clouds to a 2-D grid using RH100."""
+def _rasterize_gedi_tiles(
+    f: h5py.File, grid_res: float = 0.001, tile_px: int = 512
+) -> list[np.ndarray]:
+    """Rasterize GEDI point clouds and split long swaths into square tiles.
+
+    ``GEDI`` footprints frequently form very long, thin tracks.  Instead of
+    cropping out most of the data, this helper rasterises the entire swath and
+    then chops it into square tiles from top (north) to bottom.  Each tile is
+    resampled to ``tile_px``\*``tile_px`` pixels so it can be analysed
+    independently as an image.
+    """
 
     lats = []
     lons = []
@@ -110,16 +119,44 @@ def _rasterize_gedi(f: h5py.File, grid_res: float = 0.001) -> np.ndarray:
     rh100 = np.concatenate(rh100s)
 
     lon_lin = np.arange(lon.min(), lon.max() + grid_res, grid_res)
-    lat_lin = np.arange(lat.min(), lat.max() + grid_res, grid_res)
+    lat_lin = np.arange(lat.max(), lat.min() - grid_res, -grid_res)
     lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
 
     grid = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="linear")
     grid = np.nan_to_num(grid, nan=0.0).astype(np.float32)
-    return np.stack([grid, grid, grid], axis=2)
+    arr = np.stack([grid, grid, grid], axis=2)
+
+    import math
+    from skimage.transform import resize
+
+    width = arr.shape[1]
+    if width == 0:
+        raise ValueError("Empty raster width")
+    tile_height = width
+    n_tiles = int(math.ceil(arr.shape[0] / tile_height))
+
+    tiles: list[np.ndarray] = []
+    for i in range(n_tiles):
+        start = i * tile_height
+        end = start + tile_height
+        patch = arr[start:end]
+        if patch.shape[0] < tile_height:
+            pad = tile_height - patch.shape[0]
+            patch = np.pad(patch, ((0, pad), (0, 0), (0, 0)), mode="constant")
+        patch = resize(
+            patch,
+            (tile_px, tile_px, 3),
+            order=1,
+            preserve_range=True,
+            anti_aliasing=False,
+        ).astype(np.float32)
+        tiles.append(patch)
+
+    return tiles
 
 
-def read_h5_image(path: Path) -> np.ndarray:
-    """Read a GEDI ``.h5`` file and return a three-band image array.
+def read_h5_image(path: Path) -> list[np.ndarray]:
+    """Read a GEDI ``.h5`` file and return one or more three-band image arrays.
 
     The file may contain multiple datasets, so the dataset with the greatest
     number of elements is selected without loading each candidate into memory.
@@ -142,7 +179,7 @@ def read_h5_image(path: Path) -> np.ndarray:
                         logging.info(
                             "Rasterizing GEDI tile %s via %s", path.name, key
                         )
-                        return _rasterize_gedi(f)
+                        return _rasterize_gedi_tiles(f)
                     except Exception as exc:
                         logging.warning(
                             "Rasterization failed for %s: %s", path.name, exc
@@ -206,7 +243,7 @@ def read_h5_image(path: Path) -> np.ndarray:
             raise ValueError(f"Unexpected dataset shape {arr.shape}")
     if arr.shape[2] < 3:
         arr = np.repeat(arr, 3, axis=2)
-    return arr[:, :, :3]
+    return [arr[:, :, :3]]
 
 
 def to_false_color(arr: np.ndarray) -> Image.Image:
@@ -297,61 +334,59 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
 
 def process_file(
     h5_path: Path, tile_id: str, processed_dir: Path
-) -> tuple[typing.Optional[list], str]:
-    """Convert a single ``.h5`` file to PNG and return analysis results.
+) -> tuple[list[list], dict]:
+    """Convert a single ``.h5`` file to PNG tiles and return analysis results.
 
     The raw ``.h5`` tile is deleted only after the image has been analysed.
     Only results with a confidence score of ``6`` or higher are kept;
-    lower-confidence images are removed. The function returns a tuple
-    ``(row, status)`` where ``row`` is the CSV data or ``None`` and ``status``
-    is one of ``'passed'``, ``'skipped'`` or ``'failed'``.
+    lower-confidence images are removed.  The function returns ``(rows, stats)``
+    where ``rows`` is a list of CSV rows and ``stats`` tracks the counts of
+    ``passed``, ``skipped`` and ``failed`` tiles.
     """
 
     logging.info("Processing %s", h5_path)
 
+    rows: list[list] = []
+    stats = {"passed": 0, "skipped": 0, "failed": 0}
+
     try:
-        arr = read_h5_image(h5_path)
+        arrays = read_h5_image(h5_path)
+        for idx, arr in enumerate(arrays, 1):
+            tile_name = f"{tile_id}_{idx:03d}" if len(arrays) > 1 else tile_id
 
-        img = to_false_color(arr)
+            img = to_false_color(arr)
 
-        # Save processed image using the tile id for traceability
-        img_name = f"{tile_id}.png"
-        img_path = processed_dir / img_name
-        img.save(img_path)
+            img_name = f"{tile_name}.png"
+            img_path = processed_dir / img_name
+            img.save(img_path)
 
-        # Query the OpenAI API and append the results
-        analysis = query_openai(img_path, tile_id)
-        confidence = safe_cast(analysis.get("confidence", 0), int, 0)
+            analysis = query_openai(img_path, tile_name)
+            confidence = safe_cast(analysis.get("confidence", 0), int, 0)
 
-        if confidence >= 6:
-            row = [
-                tile_id,
-                analysis.get("pros", ""),
-                analysis.get("cons", ""),
-                confidence,
-            ]
-            status = "passed"
-        else:
-            # Remove low-confidence image and skip CSV entry
-            try:
-                img_path.unlink()
-                logging.info("Removed low confidence image %s", img_path)
-            except Exception as exc:  # pragma: no cover - deletion best effort
-                logging.warning("Failed to delete %s: %s", img_path, exc)
-            row = None
-            status = "skipped"
+            if confidence >= 6:
+                rows.append(
+                    [tile_name, analysis.get("pros", ""), analysis.get("cons", ""), confidence]
+                )
+                stats["passed"] += 1
+            else:
+                try:
+                    img_path.unlink()
+                    logging.info("Removed low confidence image %s", img_path)
+                except Exception as exc:  # pragma: no cover - deletion best effort
+                    logging.warning("Failed to delete %s: %s", img_path, exc)
+                stats["skipped"] += 1
 
-        # Delete the original h5 tile only after processing succeeded
         try:
             h5_path.unlink()
             logging.info("Deleted %s", h5_path)
         except Exception as exc:  # pragma: no cover - deletion best effort
             logging.warning("Failed to delete %s: %s", h5_path, exc)
 
-        return (row, status)
     except Exception as exc:
         logging.exception("Failed to process %s: %s", h5_path, exc)
-        return (None, "failed")
+        stats = {"passed": 0, "skipped": 0, "failed": 1}
+
+    return (rows, stats)
 
 
 def main() -> None:
@@ -406,22 +441,23 @@ def main() -> None:
                     except ValueError:
                         logging.warning("Skipping malformed filename %s", h5_file)
                         continue
-                    if tile_id in existing_ids:
+                    if any(eid.startswith(tile_id) for eid in existing_ids):
                         logging.info("Skipping %s - already processed", tile_id)
                         continue
                     futures.append(
                         executor.submit(process_file, h5_file, tile_id, processed_dir)
                     )
-                    existing_ids.add(tile_id)
 
                 stats = {"total": 0, "passed": 0, "skipped": 0, "failed": 0}
                 for future in as_completed(futures):
-                    row, status = future.result()
-                    stats["total"] += 1
-                    stats[status] += 1
-                    if row:
+                    rows, st = future.result()
+                    stats["total"] += sum(st.values())
+                    for key, val in st.items():
+                        stats[key] += val
+                    for row in rows:
                         writer.writerow(row)
                         csvfile.flush()
+                        existing_ids.add(row[0])
                 logging.info(
                     "Summary for %s: total=%d passed=%d skipped=%d failed=%d",
                     folder.name,
