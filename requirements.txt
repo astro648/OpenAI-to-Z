@@ -10,7 +10,6 @@ tqdm
 requests
 openai
 torch
-transformers
 earthengine-api
 boto3
 h5py
