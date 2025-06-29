@@ -77,7 +77,10 @@ def safe_cast(value: typing.Any, to_type: typing.Callable, default: typing.Any) 
 
 
 def _rasterize_gedi_tiles(
-    f: h5py.File, grid_res: float = 0.001, tile_px: int = 512
+    f: h5py.File,
+    grid_res: float = 0.001,
+    tile_px: int = 512,
+    max_dim: int = 2048,
 ) -> list[np.ndarray]:
     """Rasterize GEDI point clouds and split long swaths into square tiles.
 
@@ -85,7 +88,9 @@ def _rasterize_gedi_tiles(
     cropping out most of the data, this helper rasterises the entire swath and
     then chops it into square tiles from top (north) to bottom.  Each tile is
     resampled to ``tile_px``\*``tile_px`` pixels so it can be analysed
-    independently as an image.
+    independently as an image.  ``grid_res`` is automatically scaled when the
+    generated grid would exceed ``max_dim`` in either dimension so extremely
+    long swaths do not produce huge intermediate arrays.
     """
 
     lats = []
@@ -118,11 +123,21 @@ def _rasterize_gedi_tiles(
     lon = np.concatenate(lons)
     rh100 = np.concatenate(rh100s)
 
+    lon_range = lon.max() - lon.min()
+    lat_range = lat.max() - lat.min()
+    width = int(np.ceil(lon_range / grid_res)) + 1
+    height = int(np.ceil(lat_range / grid_res)) + 1
+    if max(width, height) > max_dim:
+        factor = max(width, height) / max_dim
+        grid_res *= factor
+        width = int(np.ceil(lon_range / grid_res)) + 1
+        height = int(np.ceil(lat_range / grid_res)) + 1
+
     lon_lin = np.arange(lon.min(), lon.max() + grid_res, grid_res)
     lat_lin = np.arange(lat.max(), lat.min() - grid_res, -grid_res)
     lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
 
-    grid = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="linear")
+    grid = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="nearest")
     grid = np.nan_to_num(grid, nan=0.0).astype(np.float32)
     arr = np.stack([grid, grid, grid], axis=2)
 
