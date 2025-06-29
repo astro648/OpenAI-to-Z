@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 
 import h5py
 import numpy as np
@@ -196,12 +197,13 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
             if openai_client is None:
                 openai_client = openai.OpenAI(api_key=openai.api_key)
             with image_path.open("rb") as image_file:
+                b64_data = base64.b64encode(image_file.read()).decode("utf-8")
                 response = openai_client.responses.create(
                     model="o3",
                     reasoning={"effort": "high"},
                     input=[
                         {"role": "user", "content": prompt},
-                        {"role": "user", "image": image_file},
+                        {"role": "user", "image": b64_data},
                     ],
                 )
             content = response.output_text
