@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import base64
 
 import h5py
@@ -104,7 +105,7 @@ def _rasterize_gedi_tiles(
             lat = f[key]["geolocation"]["latitude"][()]
             lon = f[key]["geolocation"]["longitude"][()]
             rh = f[key]["rh_a"][()]
-            if rh.ndim == 2 and rh.shape[1] > 100:
+            if rh.ndim > 1 and rh.shape[1] > 100:
                 rh100 = rh[:, 100]
             else:
                 continue
@@ -205,9 +206,12 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
                         return _rasterize_gedi_tiles(f)
                     except Exception as exc:
                         logging.warning(
-                            "Rasterization failed for %s: %s", path.name, exc
+                            "Rasterization failed for %s via %s: %s",
+                            path.name,
+                            key,
+                            exc,
                         )
-                        break
+                        continue
 
             target_name = None
             target_score = -1
@@ -457,15 +461,13 @@ def main() -> None:
 
             futures = []
             max_workers = min(16, os.cpu_count() or 4)
+            lock = Lock()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for h5_file in folder.glob("*.h5"):
                     try:
                         tile_id = find_tile_id(h5_file.name)
                     except ValueError:
                         logging.warning("Skipping malformed filename %s", h5_file)
-                        continue
-                    if any(eid.startswith(tile_id) for eid in existing_ids):
-                        logging.info("Skipping %s - already processed", tile_id)
                         continue
                     futures.append(
                         executor.submit(process_file, h5_file, tile_id, processed_dir)
@@ -477,10 +479,14 @@ def main() -> None:
                     stats["total"] += sum(st.values())
                     for key, val in st.items():
                         stats[key] += val
-                    for row in rows:
-                        writer.writerow(row)
-                        csvfile.flush()
-                        existing_ids.add(row[0])
+                    with lock:
+                        for row in rows:
+                            if row[0] in existing_ids:
+                                logging.info("Skipping duplicate tile %s", row[0])
+                                continue
+                            writer.writerow(row)
+                            csvfile.flush()
+                            existing_ids.add(row[0])
                 logging.info(
                     "Summary for %s: total=%d passed=%d skipped=%d failed=%d",
                     folder.name,
