@@ -182,8 +182,11 @@ def _rasterize_gedi_tiles(
 def read_h5_image(path: Path) -> list[np.ndarray]:
     """Read a GEDI ``.h5`` file and return one or more three-band image arrays.
 
-    The file may contain multiple datasets, so the dataset with the greatest
-    number of elements is selected without loading each candidate into memory.
+    When GEDI beam data is available the file is rasterised and chopped into
+    square tiles.  If rasterisation fails, an exception is raised instead of
+    falling back to the raw ``~100x80000`` style datasets.  For non-GEDI
+    datasets the largest suitable dataset is selected without loading every
+    candidate into memory.
     """
     if not path.is_file():
         raise FileNotFoundError(f"{path} does not exist")
@@ -203,7 +206,9 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
                         logging.info(
                             "Rasterizing GEDI tile %s via %s", path.name, key
                         )
-                        return _rasterize_gedi_tiles(f)
+                        tiles = _rasterize_gedi_tiles(f)
+                        if tiles:
+                            return tiles
                     except Exception as exc:
                         logging.warning(
                             "Rasterization failed for %s via %s: %s",
@@ -212,6 +217,12 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
                             exc,
                         )
                         continue
+
+            # When GEDI beams exist but rasterisation fails, avoid falling back
+            # to the raw datasets which produce ~100x80000 arrays.
+            for key in f.keys():
+                if key.startswith("BEAM") and "rh_a" in f[key]:
+                    raise ValueError("Failed to rasterize GEDI beams")
 
             target_name = None
             target_score = -1
