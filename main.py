@@ -101,21 +101,36 @@ def _rasterize_gedi_tiles(
     for key in f.keys():
         if not key.startswith("BEAM"):
             continue
-        try:
-            lat = f[key]["geolocation"]["latitude"][()]
-            lon = f[key]["geolocation"]["longitude"][()]
-            rh = f[key]["rh_a"][()]
-            if rh.ndim > 1 and rh.shape[1] > 100:
-                rh100 = rh[:, 100]
-            else:
-                continue
-            mask = np.isfinite(lat) & np.isfinite(lon) & np.isfinite(rh100)
-            if mask.any():
-                lats.append(lat[mask])
-                lons.append(lon[mask])
-                rh100s.append(rh100[mask])
-        except Exception:
+        beam = f[key]
+        if "geolocation" not in beam:
             continue
+        geo = beam["geolocation"]
+        for algo in range(1, 7):
+            lat_name = f"lat_highestreturn_a{algo}"
+            lon_name = f"lon_highestreturn_a{algo}"
+            rh_name = f"rh_a{algo}"
+            if lat_name not in geo or lon_name not in geo or rh_name not in geo:
+                continue
+            try:
+                lat = geo[lat_name][()]
+                lon = geo[lon_name][()]
+                rh = geo[rh_name][()]
+                if rh.ndim > 1 and rh.shape[1] > 100:
+                    rh100 = rh[:, 100].astype(np.float32) / 100.0
+                else:
+                    continue
+                mask = (
+                    np.isfinite(lat)
+                    & np.isfinite(lon)
+                    & np.isfinite(rh100)
+                    & (rh100 > 0)
+                )
+                if mask.any():
+                    lats.append(lat[mask])
+                    lons.append(lon[mask])
+                    rh100s.append(rh100[mask])
+            except Exception:
+                continue
 
     if not lats:
         raise ValueError("No GEDI beam data found")
@@ -194,10 +209,24 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
 
     try:
         with h5py.File(path, "r") as f:
-            has_beam = any(
-                key.startswith("BEAM") and "geolocation" in f[key] and "rh_a" in f[key]
-                for key in f.keys()
-            )
+            has_beam = False
+            for key in f.keys():
+                if not key.startswith("BEAM"):
+                    continue
+                beam = f[key]
+                geo = beam.get("geolocation")
+                if not isinstance(geo, h5py.Group):
+                    continue
+                for algo in range(1, 7):
+                    if (
+                        f"lat_highestreturn_a{algo}" in geo
+                        and f"lon_highestreturn_a{algo}" in geo
+                        and f"rh_a{algo}" in geo
+                    ):
+                        has_beam = True
+                        break
+                if has_beam:
+                    break
             if not has_beam:
                 raise ValueError(f"No GEDI beam data found in {path.name}")
 
