@@ -198,14 +198,21 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
                 openai_client = openai.OpenAI(api_key=openai.api_key)
             with image_path.open("rb") as image_file:
                 b64_data = base64.b64encode(image_file.read()).decode("utf-8")
-                response = openai_client.responses.create(
-                    model="o3",
-                    reasoning={"effort": "high"},
-                    input=[
-                        {"role": "user", "content": prompt},
-                        {"role": "user", "image": b64_data},
-                    ],
-                )
+                data_url = f"data:image/png;base64,{b64_data}"
+
+            response = openai_client.responses.create(
+                model="o3",
+                reasoning={"effort": "high"},
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": data_url},
+                        ],
+                    }
+                ],
+            )
             content = response.output_text
         except Exception as exc:
             logging.error("OpenAI API call failed: %s", exc)
