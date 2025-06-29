@@ -22,6 +22,8 @@ import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import base64
+from io import BytesIO
+import argparse
 
 import h5py
 import numpy as np
@@ -31,9 +33,6 @@ from scipy.interpolate import griddata
 import openai
 import csv
 
-# Global OpenAI client reused across requests
-openai_client: typing.Optional[openai.OpenAI] = None
-
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -41,20 +40,17 @@ logging.basicConfig(level=logging.INFO,
 API_KEY_FILE = Path(__file__).resolve().parent / "openai_api_key.txt"
 
 
-def load_openai_key() -> str:
-    """Read the OpenAI API key from ``openai_api_key.txt`` if available."""
+def load_openai_client() -> typing.Optional[openai.OpenAI]:
+    """Load the OpenAI API key and return a client instance if available."""
     try:
         key = API_KEY_FILE.read_text().strip()
         if key:
-            openai.api_key = key
-            global openai_client
-            openai_client = openai.OpenAI(api_key=key)
             logging.info("Loaded OpenAI API key from %s", API_KEY_FILE)
-            return key
+            return openai.OpenAI(api_key=key)
         logging.warning("OpenAI API key file %s is empty", API_KEY_FILE)
     except FileNotFoundError:
         logging.warning("OpenAI API key file %s not found", API_KEY_FILE)
-    return ""
+    return None
 
 def find_tile_id(filename: str) -> str:
     """Extract the five-digit tile id from a GEDI file name."""
@@ -334,8 +330,13 @@ def to_false_color(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
-def query_openai(image_path: Path, tile_id: str) -> dict:
-    """Send image to the OpenAI API and return structured analysis."""
+def query_openai(img: Image.Image, tile_id: str, client: typing.Optional[openai.OpenAI]) -> dict:
+    """Send image to the OpenAI API and return structured analysis.
+
+    The function **requires** a valid ``OpenAI`` client.  If ``client`` is ``None``
+    or the API request fails, a ``RuntimeError`` is raised so the caller can
+    terminate processing without writing placeholder data.
+    """
     prompt = (
         "You are analyzing a Lidar-derived false color image generated from GEDI data."
         " The image has heavy foliage, vegetation, and considerable noise."
@@ -345,41 +346,32 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
         " 'confidence' must be an integer score from 1-10."
     )
 
-    if openai.api_key:
-        try:
-            logging.info("Sending image %s to OpenAI", image_path)
-            global openai_client
-            if openai_client is None:
-                openai_client = openai.OpenAI(api_key=openai.api_key)
-            with image_path.open("rb") as image_file:
-                b64_data = base64.b64encode(image_file.read()).decode("utf-8")
-                data_url = f"data:image/png;base64,{b64_data}"
+    if client is None:
+        raise RuntimeError("OpenAI client not configured")
 
-            response = openai_client.responses.create(
-                model="o3",
-                reasoning={"effort": "high"},
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_url": data_url},
-                        ],
-                    }
-                ],
-            )
-            content = response.output_text
-        except Exception as exc:
-            logging.error("OpenAI API call failed: %s", exc)
-            content = "{}"
-    else:
-        # Placeholder response when no API key is configured
-        logging.info("OpenAI API key missing - using placeholder response")
-        content = json.dumps({
-            "pros": "clearings visible; geometric shapes; elevation changes",
-            "cons": "heavy vegetation; data noise; no obvious structures",
-            "confidence": 5,
-        })
+    try:
+        logging.info("Sending tile %s to OpenAI", tile_id)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+        data_url = f"data:image/png;base64,{b64_data}"
+        response = client.responses.create(
+            model="o3",
+            reasoning={"effort": "high"},
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                }
+            ],
+        )
+        content = response.output_text
+    except Exception as exc:
+        logging.error("OpenAI API call failed: %s", exc)
+        raise RuntimeError("OpenAI API request failed") from exc
 
     try:
         result = json.loads(content)
@@ -391,7 +383,7 @@ def query_openai(image_path: Path, tile_id: str) -> dict:
 
 
 def process_file(
-    h5_path: Path, tile_id: str, processed_dir: Path
+    h5_path: Path, tile_prefix: str, processed_dir: Path, client: typing.Optional[openai.OpenAI]
 ) -> tuple[list[list], dict]:
     """Convert a single ``.h5`` file to PNG tiles and return analysis results.
 
@@ -407,42 +399,29 @@ def process_file(
     rows: list[list] = []
     stats = {"passed": 0, "skipped": 0, "failed": 0}
 
-    try:
-        arrays = read_h5_image(h5_path)
-        for idx, arr in enumerate(arrays, 1):
-            tile_name = f"{tile_id}_{idx:03d}" if len(arrays) > 1 else tile_id
+    arrays = read_h5_image(h5_path)
+    for idx, arr in enumerate(arrays, 1):
+        tile_name = f"{tile_prefix}_{idx:03d}" if len(arrays) > 1 else tile_prefix
 
-            img = to_false_color(arr)
+        img = to_false_color(arr)
 
+        analysis = query_openai(img, tile_name, client)
+        confidence = safe_cast(analysis.get("confidence", 0), int, 0)
+
+        if confidence >= 6:
             img_name = f"{tile_name}.png"
             img_path = processed_dir / img_name
             img.save(img_path)
+            rows.append(
+                [tile_name, analysis.get("pros", ""), analysis.get("cons", ""), confidence]
+            )
+            stats["passed"] += 1
+        else:
+            stats["skipped"] += 1
 
-            analysis = query_openai(img_path, tile_name)
-            confidence = safe_cast(analysis.get("confidence", 0), int, 0)
+    h5_path.unlink(missing_ok=True)
+    logging.info("Deleted %s", h5_path)
 
-            if confidence >= 6:
-                rows.append(
-                    [tile_name, analysis.get("pros", ""), analysis.get("cons", ""), confidence]
-                )
-                stats["passed"] += 1
-            else:
-                try:
-                    img_path.unlink()
-                    logging.info("Removed low confidence image %s", img_path)
-                except Exception as exc:  # pragma: no cover - deletion best effort
-                    logging.warning("Failed to delete %s: %s", img_path, exc)
-                stats["skipped"] += 1
-
-        try:
-            h5_path.unlink()
-            logging.info("Deleted %s", h5_path)
-        except Exception as exc:  # pragma: no cover - deletion best effort
-            logging.warning("Failed to delete %s: %s", h5_path, exc)
-
-    except Exception as exc:
-        logging.exception("Failed to process %s: %s", h5_path, exc)
-        stats = {"passed": 0, "skipped": 0, "failed": 1}
 
     return (rows, stats)
 
@@ -450,14 +429,37 @@ def process_file(
 def main() -> None:
     """Walk the ``data/raw`` directories and process each GEDI tile."""
 
-    # Load API key if available to enable real OpenAI queries
-    load_openai_key()
+    parser = argparse.ArgumentParser(description="Process GEDI tiles")
+    parser.add_argument(
+        "--raw-root",
+        type=Path,
+        default=Path(__file__).parent / "data" / "raw",
+        help="Directory containing raw .h5 files",
+    )
+    parser.add_argument(
+        "--processed-root",
+        type=Path,
+        default=Path(__file__).parent / "data" / "processed",
+        help="Directory to write processed images",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path(__file__).parent / "results",
+        help="Directory to store result CSV files",
+    )
+    args = parser.parse_args()
 
-    raw_root = Path(__file__).parent / "data" / "raw"
-    processed_root = Path(__file__).parent / "data" / "processed"
+    openai_client = load_openai_client()
+    if openai_client is None:
+        logging.error("OpenAI API key missing - aborting")
+        return
+
+    raw_root = args.raw_root
+    processed_root = args.processed_root
     processed_root.mkdir(parents=True, exist_ok=True)
 
-    results_dir = Path(__file__).parent / "results"
+    results_dir = args.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
 
     name_map = {
@@ -500,8 +502,9 @@ def main() -> None:
                     except ValueError:
                         logging.warning("Skipping malformed filename %s", h5_file)
                         continue
+                    tile_prefix = f"{folder.name}_{tile_id}"
                     futures.append(
-                        executor.submit(process_file, h5_file, tile_id, processed_dir)
+                        executor.submit(process_file, h5_file, tile_prefix, processed_dir, openai_client)
                     )
 
                 stats = {"total": 0, "passed": 0, "skipped": 0, "failed": 0}
@@ -516,8 +519,8 @@ def main() -> None:
                                 logging.info("Skipping duplicate tile %s", row[0])
                                 continue
                             writer.writerow(row)
-                            csvfile.flush()
                             existing_ids.add(row[0])
+                csvfile.flush()
                 logging.info(
                     "Summary for %s: total=%d passed=%d skipped=%d failed=%d",
                     folder.name,
