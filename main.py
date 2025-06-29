@@ -26,6 +26,7 @@ import h5py
 import numpy as np
 from PIL import Image
 from skimage import exposure
+from scipy.interpolate import griddata
 import openai
 import csv
 
@@ -75,6 +76,48 @@ def safe_cast(value: typing.Any, to_type: typing.Callable, default: typing.Any) 
         return default
 
 
+def _rasterize_gedi(f: h5py.File, grid_res: float = 0.001) -> np.ndarray:
+    """Rasterize GEDI point clouds to a 2-D grid using RH100."""
+
+    lats = []
+    lons = []
+    rh100s = []
+
+    for key in f.keys():
+        if not key.startswith("BEAM"):
+            continue
+        try:
+            lat = f[key]["geolocation"]["latitude"][()]
+            lon = f[key]["geolocation"]["longitude"][()]
+            rh = f[key]["rh_a"][()]
+            if rh.ndim == 2 and rh.shape[1] > 100:
+                rh100 = rh[:, 100]
+            else:
+                continue
+            mask = np.isfinite(lat) & np.isfinite(lon) & np.isfinite(rh100)
+            if mask.any():
+                lats.append(lat[mask])
+                lons.append(lon[mask])
+                rh100s.append(rh100[mask])
+        except Exception:
+            continue
+
+    if not lats:
+        raise ValueError("No GEDI beam data found")
+
+    lat = np.concatenate(lats)
+    lon = np.concatenate(lons)
+    rh100 = np.concatenate(rh100s)
+
+    lon_lin = np.arange(lon.min(), lon.max() + grid_res, grid_res)
+    lat_lin = np.arange(lat.min(), lat.max() + grid_res, grid_res)
+    lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
+
+    grid = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="linear")
+    grid = np.nan_to_num(grid, nan=0.0).astype(np.float32)
+    return np.stack([grid, grid, grid], axis=2)
+
+
 def read_h5_image(path: Path) -> np.ndarray:
     """Read a GEDI ``.h5`` file and return a three-band image array.
 
@@ -86,9 +129,26 @@ def read_h5_image(path: Path) -> np.ndarray:
     if not h5py.is_hdf5(path):
         raise ValueError(f"{path} is not a valid HDF5 file")
 
-    # Choose a dataset based on heuristics rather than raw size
+    # Attempt GEDI rasterisation first
     try:
         with h5py.File(path, "r") as f:
+            for key in f.keys():
+                if (
+                    key.startswith("BEAM")
+                    and "geolocation" in f[key]
+                    and "rh_a" in f[key]
+                ):
+                    try:
+                        logging.info(
+                            "Rasterizing GEDI tile %s via %s", path.name, key
+                        )
+                        return _rasterize_gedi(f)
+                    except Exception as exc:
+                        logging.warning(
+                            "Rasterization failed for %s: %s", path.name, exc
+                        )
+                        break
+
             target_name = None
             target_score = -1
             backup_name = None
