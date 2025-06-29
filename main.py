@@ -40,13 +40,30 @@ logging.basicConfig(level=logging.INFO,
 API_KEY_FILE = Path(__file__).resolve().parent / "openai_api_key.txt"
 
 
-def load_openai_client() -> typing.Optional[openai.OpenAI]:
-    """Load the OpenAI API key and return a client instance if available."""
+def configure_compute_threads(workers: int) -> None:
+    """Limit numpy/BLAS thread usage when using multiple workers."""
+    if workers > 1:
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def load_openai_client(timeout: float = 60.0) -> typing.Optional[openai.OpenAI]:
+    """Load the OpenAI API key and return a client instance if available.
+
+    A ``timeout`` can be provided to prevent API requests from hanging
+    indefinitely.  The value is passed directly to :class:`openai.OpenAI`.
+    """
     try:
         key = API_KEY_FILE.read_text().strip()
         if key:
-            logging.info("Loaded OpenAI API key from %s", API_KEY_FILE)
-            return openai.OpenAI(api_key=key)
+            logging.info(
+                "Loaded OpenAI API key from %s with timeout=%ss",
+                API_KEY_FILE,
+                timeout,
+            )
+            return openai.OpenAI(api_key=key, timeout=timeout)
         logging.warning("OpenAI API key file %s is empty", API_KEY_FILE)
     except FileNotFoundError:
         logging.warning("OpenAI API key file %s not found", API_KEY_FILE)
@@ -485,9 +502,23 @@ def main() -> None:
         default=Path(__file__).parent / "results",
         help="Directory to store result CSV files",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="OpenAI request timeout in seconds",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(16, os.cpu_count() or 4),
+        help="Number of worker threads for tile processing",
+    )
     args = parser.parse_args()
 
-    openai_client = load_openai_client()
+    configure_compute_threads(args.workers)
+
+    openai_client = load_openai_client(timeout=args.timeout)
     if openai_client is None:
         logging.error("OpenAI API key missing - aborting")
         return
@@ -530,8 +561,9 @@ def main() -> None:
                 writer.writerow(["id", "pros", "cons", "confidence"])
 
             futures = []
-            max_workers = min(16, os.cpu_count() or 4)
+            max_workers = max(1, args.workers)
             lock = Lock()
+            logging.info("Starting thread pool with %s workers", max_workers)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for h5_file in folder.glob("*.h5"):
                     try:
