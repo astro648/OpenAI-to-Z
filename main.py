@@ -97,6 +97,8 @@ def _rasterize_gedi_tiles(
     lats = []
     lons = []
     rh100s = []
+    elevs = []
+    energies = []
 
     for key in f.keys():
         if not key.startswith("BEAM"):
@@ -109,26 +111,56 @@ def _rasterize_gedi_tiles(
             lat_name = f"lat_highestreturn_a{algo}"
             lon_name = f"lon_highestreturn_a{algo}"
             rh_name = f"rh_a{algo}"
+            elev_name = f"elev_highestreturn_a{algo}"
+            qual_name = f"quality_flag_a{algo}"
             if lat_name not in geo or lon_name not in geo or rh_name not in geo:
                 continue
             try:
                 lat = geo[lat_name][()]
                 lon = geo[lon_name][()]
                 rh = geo[rh_name][()]
+                elev = None
+                if elev_name in geo:
+                    elev = geo[elev_name][()]
+                elif "elevation_1gfit" in geo:
+                    elev = geo["elevation_1gfit"][()]
                 if rh.ndim > 1 and rh.shape[1] > 100:
                     rh100 = rh[:, 100].astype(np.float32) / 100.0
                 else:
                     continue
+                rx_group = beam.get(f"rx_processing_a{algo}")
+                energy = None
+                if isinstance(rx_group, h5py.Group):
+                    if "rx_maxamp" in rx_group:
+                        energy = rx_group["rx_maxamp"][()]
+                    elif "rx_energy" in rx_group:
+                        energy = rx_group["rx_energy"][()]
+                quality_mask = np.ones_like(rh100, dtype=bool)
+                if qual_name in geo:
+                    quality_mask &= geo[qual_name][()] == 1
+                if "degrade_flag" in geo:
+                    quality_mask &= geo["degrade_flag"][()] == 0
+                if "stale_return_flag" in geo:
+                    quality_mask &= geo["stale_return_flag"][()] == 0
                 mask = (
                     np.isfinite(lat)
                     & np.isfinite(lon)
                     & np.isfinite(rh100)
                     & (rh100 > 0)
+                    & quality_mask
                 )
+                if elev is not None:
+                    mask &= np.isfinite(elev)
+                if energy is not None:
+                    mask &= np.isfinite(energy)
                 if mask.any():
                     lats.append(lat[mask])
                     lons.append(lon[mask])
                     rh100s.append(rh100[mask])
+                    if elev is not None:
+                        elevs.append(elev[mask])
+                    if energy is not None:
+                        energies.append(energy[mask])
             except Exception:
                 continue
 
@@ -138,6 +170,28 @@ def _rasterize_gedi_tiles(
     lat = np.concatenate(lats)
     lon = np.concatenate(lons)
     rh100 = np.concatenate(rh100s)
+    elev = np.concatenate(elevs) if elevs else np.zeros_like(rh100)
+    energy = np.concatenate(energies) if energies else np.zeros_like(rh100)
+
+    lat_q1, lat_q3 = np.percentile(lat, [25, 75])
+    lon_q1, lon_q3 = np.percentile(lon, [25, 75])
+    lat_iqr = lat_q3 - lat_q1
+    lon_iqr = lon_q3 - lon_q1
+    lat_low = lat_q1 - 1.5 * lat_iqr
+    lat_high = lat_q3 + 1.5 * lat_iqr
+    lon_low = lon_q1 - 1.5 * lon_iqr
+    lon_high = lon_q3 + 1.5 * lon_iqr
+    keep = (
+        (lat >= lat_low)
+        & (lat <= lat_high)
+        & (lon >= lon_low)
+        & (lon <= lon_high)
+    )
+    lat = lat[keep]
+    lon = lon[keep]
+    rh100 = rh100[keep]
+    elev = elev[keep]
+    energy = energy[keep]
 
     lon_range = lon.max() - lon.min()
     lat_range = lat.max() - lat.min()
@@ -153,9 +207,15 @@ def _rasterize_gedi_tiles(
     lat_lin = np.arange(lat.max(), lat.min() - grid_res, -grid_res)
     lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
 
-    grid = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="nearest")
-    grid = np.nan_to_num(grid, nan=0.0).astype(np.float32)
-    arr = np.stack([grid, grid, grid], axis=2)
+    grid_rh = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="nearest")
+    grid_elev = griddata((lon, lat), elev, (lon_grid, lat_grid), method="nearest")
+    grid_energy = griddata((lon, lat), energy, (lon_grid, lat_grid), method="nearest")
+
+    grid_rh = np.nan_to_num(grid_rh, nan=0.0).astype(np.float32)
+    grid_elev = np.nan_to_num(grid_elev, nan=0.0).astype(np.float32)
+    grid_energy = np.nan_to_num(grid_energy, nan=0.0).astype(np.float32)
+
+    arr = np.stack([grid_rh, grid_elev, grid_energy], axis=2)
 
     import math
     from skimage.transform import resize
@@ -240,7 +300,12 @@ def read_h5_image(path: Path) -> list[np.ndarray]:
 
 
 def to_false_color(arr: np.ndarray) -> Image.Image:
-    """Convert an array to a high‑contrast false‑color ``PIL.Image``."""
+    """Convert a 3-band array to a high‑contrast false‑color ``PIL.Image``.
+
+    The input array should contain canopy height, terrain elevation and
+    waveform energy in separate channels.  Each band is normalised and
+    contrast-enhanced independently before merging into an RGB image.
+    """
 
     # Replace NaNs and normalise each band separately
     for i in range(arr.shape[2]):
