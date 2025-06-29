@@ -30,6 +30,7 @@ import numpy as np
 from PIL import Image
 from skimage import exposure
 from scipy.interpolate import griddata
+from numpy.typing import ArrayLike
 import openai
 import csv
 
@@ -88,6 +89,28 @@ def safe_cast(value: typing.Any, to_type: typing.Callable, default: typing.Any) 
         except Exception:
             pass
         return default
+
+
+def _grid_average(
+    lon: ArrayLike,
+    lat: ArrayLike,
+    values: ArrayLike,
+    lon_edges: np.ndarray,
+    lat_edges: np.ndarray,
+) -> np.ndarray:
+    """Return the average of ``values`` aggregated into the specified grid."""
+    sum_grid, _, _ = np.histogram2d(
+        lat, lon, bins=[lat_edges, lon_edges], weights=values
+    )
+    count_grid, _, _ = np.histogram2d(lat, lon, bins=[lat_edges, lon_edges])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avg = np.divide(
+            sum_grid,
+            count_grid,
+            out=np.zeros_like(sum_grid, dtype=np.float32),
+            where=count_grid > 0,
+        )
+    return avg.astype(np.float32)
 
 
 def _rasterize_gedi_tiles(
@@ -236,23 +259,18 @@ def _rasterize_gedi_tiles(
         width = int(np.ceil(lon_range / grid_res)) + 1
         height = int(np.ceil(lat_range / grid_res)) + 1
 
-    lon_lin = np.arange(lon.min(), lon.max() + grid_res, grid_res)
-    lat_lin = np.arange(lat.max(), lat.min() - grid_res, -grid_res)
-    lon_grid, lat_grid = np.meshgrid(lon_lin, lat_lin)
+    lon_edges = np.arange(lon.min(), lon.max() + grid_res, grid_res)
+    lat_edges = np.arange(lat.min(), lat.max() + grid_res, grid_res)
     logging.info(
         "Raster grid %sx%s with resolution %s",
-        len(lat_lin),
-        len(lon_lin),
+        len(lat_edges) - 1,
+        len(lon_edges) - 1,
         grid_res,
     )
 
-    grid_rh = griddata((lon, lat), rh100, (lon_grid, lat_grid), method="nearest")
-    grid_elev = griddata((lon, lat), elev, (lon_grid, lat_grid), method="nearest")
-    grid_energy = griddata((lon, lat), energy, (lon_grid, lat_grid), method="nearest")
-
-    grid_rh = np.nan_to_num(grid_rh, nan=0.0).astype(np.float32)
-    grid_elev = np.nan_to_num(grid_elev, nan=0.0).astype(np.float32)
-    grid_energy = np.nan_to_num(grid_energy, nan=0.0).astype(np.float32)
+    grid_rh = _grid_average(lon, lat, rh100, lon_edges, lat_edges)[::-1]
+    grid_elev = _grid_average(lon, lat, elev, lon_edges, lat_edges)[::-1]
+    grid_energy = _grid_average(lon, lat, energy, lon_edges, lat_edges)[::-1]
 
     arr = np.stack([grid_rh, grid_elev, grid_energy], axis=2)
     logging.info("Stacked raster array shape %s", arr.shape)
