@@ -180,108 +180,34 @@ def _rasterize_gedi_tiles(
 
 
 def read_h5_image(path: Path) -> list[np.ndarray]:
-    """Read a GEDI ``.h5`` file and return one or more three-band image arrays.
+    """Read and rasterise a GEDI ``.h5`` file into square image tiles.
 
-    When GEDI beam data is available the file is rasterised and chopped into
-    square tiles.  If rasterisation fails, an exception is raised instead of
-    falling back to the raw ``~100x80000`` style datasets.  For non-GEDI
-    datasets the largest suitable dataset is selected without loading every
-    candidate into memory.
+    All input files must contain GEDI beam data.  The beams are combined,
+    rasterised and chopped into equally sized tiles which are returned as a
+    list of three-band arrays.  Failure to produce these tiles results in an
+    exception and the file is considered invalid.
     """
     if not path.is_file():
         raise FileNotFoundError(f"{path} does not exist")
     if not h5py.is_hdf5(path):
         raise ValueError(f"{path} is not a valid HDF5 file")
 
-    # Attempt GEDI rasterisation first
     try:
         with h5py.File(path, "r") as f:
-            for key in f.keys():
-                if (
-                    key.startswith("BEAM")
-                    and "geolocation" in f[key]
-                    and "rh_a" in f[key]
-                ):
-                    try:
-                        logging.info(
-                            "Rasterizing GEDI tile %s via %s", path.name, key
-                        )
-                        tiles = _rasterize_gedi_tiles(f)
-                        if tiles:
-                            return tiles
-                    except Exception as exc:
-                        logging.warning(
-                            "Rasterization failed for %s via %s: %s",
-                            path.name,
-                            key,
-                            exc,
-                        )
-                        continue
-
-            # When GEDI beams exist but rasterisation fails, avoid falling back
-            # to the raw datasets which produce ~100x80000 arrays.
-            for key in f.keys():
-                if key.startswith("BEAM") and "rh_a" in f[key]:
-                    raise ValueError("Failed to rasterize GEDI beams")
-
-            target_name = None
-            target_score = -1
-            backup_name = None
-            backup_size = 0
-            single_channel_name = None
-
-            def visitor(name, obj):
-                nonlocal target_name, target_score, backup_name, backup_size, single_channel_name
-                if not isinstance(obj, h5py.Dataset) or obj.ndim < 2:
-                    return
-
-                # Preferred: a 2-D array with many rows and a small band count
-                if (
-                    obj.ndim == 2
-                    and obj.shape[0] > 1000
-                    and obj.shape[1] in (3, 6, 8)
-                ):
-                    rows = obj.shape[0]
-                    if rows > target_score:
-                        target_name = name
-                        target_score = rows
-
-                # Backup candidate when only one band exists
-                if obj.ndim == 2 and (1 in obj.shape) and single_channel_name is None:
-                    single_channel_name = name
-
-                # Fallback: keep track of the largest dataset in case no match
-                size = np.prod(obj.shape)
-                if size > backup_size:
-                    backup_name = name
-                    backup_size = size
-
-            f.visititems(visitor)
-            chosen = target_name or single_channel_name or backup_name
-            if chosen is None:
-                raise ValueError("No suitable dataset found")
-            arr = f[chosen][...]
-            if arr.dtype != np.float32:
-                arr = arr.astype(np.float32)
-            logging.info(
-                "Using dataset '%s' from %s with shape %s",
-                chosen,
-                path.name,
-                arr.shape,
+            has_beam = any(
+                key.startswith("BEAM") and "geolocation" in f[key] and "rh_a" in f[key]
+                for key in f.keys()
             )
+            if not has_beam:
+                raise ValueError(f"No GEDI beam data found in {path.name}")
+
+            logging.info("Rasterizing GEDI tile %s", path.name)
+            tiles = _rasterize_gedi_tiles(f)
+            if not tiles:
+                raise ValueError("Rasterization produced no tiles")
+            return tiles
     except OSError as exc:
         raise ValueError(f"Failed to open {path}: {exc}") from exc
-    if arr.ndim == 2:
-        arr = np.repeat(arr[..., np.newaxis], 3, axis=2)
-    elif arr.ndim > 3:
-        logging.debug("Reshaping dataset from %s", arr.shape)
-        arr = arr.reshape(arr.shape[0], arr.shape[1], -1)
-        logging.debug("Reshaped to %s", arr.shape)
-        if arr.ndim != 3 or not (1 <= arr.shape[2] <= 10):
-            raise ValueError(f"Unexpected dataset shape {arr.shape}")
-    if arr.shape[2] < 3:
-        arr = np.repeat(arr, 3, axis=2)
-    return [arr[:, :, :3]]
 
 
 def to_false_color(arr: np.ndarray) -> Image.Image:
