@@ -47,8 +47,16 @@ def search(short_name: str, bbox: tuple[float, float, float, float]):
     )
 
 
-def download(granules, target: str | Path) -> None:
+from itertools import islice
+
+
+def download(granules, target: str | Path, limit: int | None = None) -> None:
+    """Download ``granules`` into ``target`` with an optional limit."""
     target_path = Path(target)
     target_path.mkdir(parents=True, exist_ok=True)
+
+    if limit is not None:
+        granules = list(islice(granules, limit))
+
     earthaccess.download(granules, str(target_path))
 
