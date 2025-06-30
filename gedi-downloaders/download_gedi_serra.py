@@ -6,11 +6,14 @@ BBOX = (-74.0, -8.0, -72.5, -6.0)  # Serra do Divisor
 TARGET = utils.data_path("serra")
 
 
+LIMIT = 200
+
+
 def main() -> None:
     utils.login()
     granules = utils.search("GEDI02_A", BBOX)
     print(f"Found {len(granules)} GEDI granules in Serra do Divisor")
-    utils.download(granules, TARGET)
+    utils.download(granules, TARGET, limit=LIMIT)
 
 
 if __name__ == "__main__":
