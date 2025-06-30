@@ -291,16 +291,13 @@ def _rasterize_gedi_tiles(
     for i in range(n_tiles):
         start = i * tile_size
         end = start + tile_size
+        patch = np.zeros((tile_size, tile_size, arr.shape[2]), dtype=arr.dtype)
         if along_height:
-            patch = arr[start:end]
-            if patch.shape[0] < tile_size:
-                pad = tile_size - patch.shape[0]
-                patch = np.pad(patch, ((0, pad), (0, 0), (0, 0)), mode="constant")
+            src = arr[start:end]
+            patch[: src.shape[0], : src.shape[1]] = src
         else:
-            patch = arr[:, start:end]
-            if patch.shape[1] < tile_size:
-                pad = tile_size - patch.shape[1]
-                patch = np.pad(patch, ((0, 0), (0, pad), (0, 0)), mode="constant")
+            src = arr[:, start:end]
+            patch[: src.shape[0], : src.shape[1]] = src
         logging.info("  Rasterizing tile %s/%s", i + 1, n_tiles)
         patch = resize(
             patch,
@@ -471,13 +468,25 @@ def process_file(
     rows: list[list] = []
     stats = {"passed": 0, "skipped": 0, "failed": 0}
 
-    arrays = read_h5_image(h5_path)
+    try:
+        arrays = read_h5_image(h5_path)
+    except Exception as exc:
+        logging.error("Failed to read %s: %s", h5_path, exc)
+        stats["failed"] += 1
+        h5_path.unlink(missing_ok=True)
+        return (rows, stats)
+
     for idx, arr in enumerate(arrays, 1):
         tile_name = f"{tile_prefix}_{idx:03d}" if len(arrays) > 1 else tile_prefix
 
-        img = to_false_color(arr)
+        try:
+            img = to_false_color(arr)
+            analysis = query_openai(img, tile_name, client)
+        except Exception as exc:
+            logging.error("Tile %s failed: %s", tile_name, exc)
+            stats["failed"] += 1
+            continue
 
-        analysis = query_openai(img, tile_name, client)
         confidence = safe_cast(analysis.get("confidence", 0), int, 0)
 
         if confidence >= 6:
@@ -596,7 +605,11 @@ def main() -> None:
 
                 stats = {"total": 0, "passed": 0, "skipped": 0, "failed": 0}
                 for future in as_completed(futures):
-                    rows, st = future.result()
+                    try:
+                        rows, st = future.result()
+                    except Exception as exc:
+                        logging.error("Worker failed: %s", exc)
+                        rows, st = [], {"passed": 0, "skipped": 0, "failed": 1}
                     stats["total"] += sum(st.values())
                     for key, val in st.items():
                         stats[key] += val
